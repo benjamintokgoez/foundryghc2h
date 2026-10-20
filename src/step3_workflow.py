@@ -13,6 +13,7 @@ from src.foundry_client import (
 )
 from src.step1_triage import WorkloadTriageAgent
 from src.step2_mcp_tools import get_cluster_telemetry, get_grid_carbon_intensity
+from src.step4_governance import EcoPulseTracer, PromptShieldFilter
 
 
 class WorkloadRequest(BaseModel):
@@ -169,6 +170,26 @@ async def _analyze(workload_request: dict) -> dict:
     return plan.model_dump()
 
 
+async def _run_traced(workload_request: dict) -> dict:
+    request = WorkloadRequest.model_validate(workload_request)
+    metrics = get_workload_metrics(request.workload_id)
+    tracer = EcoPulseTracer()
+    with tracer.activate():
+        # Basecamp observes only; the challenge adds mandatory block enforcement.
+        PromptShieldFilter().check(metrics["deployment_notes"])
+        plan = await _analyze({"workload_id": request.workload_id})
+        if plan["target_gco2_kwh"] is not None and plan["current_gco2_kwh"] > 0:
+            tracer.record(
+                "carbon.saved_estimate", advisory_only=True,
+                estimated_co2_reduction_pct=round(
+                    100 * (plan["current_gco2_kwh"] - plan["target_gco2_kwh"])
+                    / plan["current_gco2_kwh"], 2,
+                ),
+            )
+        plan["trace_events"] = list(tracer.trace_events)
+        return plan
+
+
 def run_ecopulse_workflow(workload_request: dict) -> dict:
     """Synchronous workshop entry point; async applications can use Workflow."""
-    return asyncio.run(Workflow(_analyze).run(workload_request))
+    return asyncio.run(Workflow(_run_traced).run(workload_request))
