@@ -2,8 +2,8 @@
 
 ## Building Sustainable Cloud Agents with Microsoft Foundry, Microsoft Agent Framework & GitHub Copilot
 
-**Benjamin Tokgöz & Alexandra Schroeder** welcome you to Project EcoPulse:
-a two-hour, hands-on journey into carbon-aware cloud operations and Green AI.
+Welcome to **Project EcoPulse**: a two-hour, hands-on journey into carbon-aware
+cloud operations and Green AI.
 Build a triage agent, wire MCP-shaped telemetry tools, fan out across specialist
 agents, then govern a safe workload shift in a 30-minute challenge.
 
@@ -117,6 +117,12 @@ Model analysis is probabilistic in live mode. Authorization, action arguments,
 receipts, critic arithmetic, and SLA enforcement stay in deterministic trusted
 code. The four reproducible reference scenarios are verified in simulation.
 Do not submit private deployment notes to an external provider.
+
+## Reuse and license
+
+This workshop is available under the [MIT License](LICENSE). You can use, modify,
+and redistribute it, including adapting it for your own workshops. Retain the
+license and copyright notice when redistributing copies or substantial portions.
 
 ## Publish when ready
 
