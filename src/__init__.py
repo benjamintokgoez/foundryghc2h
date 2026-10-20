@@ -1,0 +1,1 @@
+"""Project EcoPulse workshop agents."""
