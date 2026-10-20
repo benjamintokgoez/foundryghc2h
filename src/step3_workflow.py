@@ -1,4 +1,4 @@
-"""Micro-Task #3: triage, concurrent specialists, and an advisory shift plan."""
+"""Complete EcoPulse workflow: analyze, authorize, execute, and critique."""
 
 import asyncio
 import os
@@ -12,8 +12,10 @@ from src.foundry_client import (
     Agent, MODEL_FAST_GREEN, MODEL_REASONING, ToolResults, Workflow, get_chat_client,
 )
 from src.step1_triage import WorkloadTriageAgent
-from src.step2_mcp_tools import get_cluster_telemetry, get_grid_carbon_intensity
-from src.step4_governance import EcoPulseTracer, PromptShieldFilter
+from src.step2_mcp_tools import (
+    execute_workload_shift, get_cluster_telemetry, get_grid_carbon_intensity,
+)
+from src.step4_governance import EcoPulseTracer, GovernancePolicyGate, PromptShieldFilter
 
 
 class WorkloadRequest(BaseModel):
@@ -58,6 +60,27 @@ class GreenShiftPlan(BaseModel):
     model_tiers: dict[str, str]
     entra_agent_id: str
     trace_events: list[dict] = Field(default_factory=list)
+
+
+class ShiftExecutionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workload_id: str
+    status: str
+    target_region: str
+    entra_agent_id: str
+    source_region: str | None = None
+    shift_type: str | None = None
+    estimated_co2_reduction_pct: float | None = Field(default=None, ge=0, le=100)
+    simulated: bool = True
+    reason: str | None = None
+
+
+class ImpactAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    estimated_co2_reduction_pct: float = Field(ge=0, le=100)
+    green_ai_score: float = Field(ge=0, le=100)
 
 
 def _grid_assessment(request: dict, results: ToolResults) -> dict:
@@ -141,6 +164,62 @@ class CloudReliabilityAgent(Agent):
         )
 
 
+class GreenShiftExecutorAgent(Agent):
+    def __init__(self):
+        super().__init__(
+            name="GreenShiftExecutorAgent", client=get_chat_client(MODEL_FAST_GREEN),
+            instructions="Execute only a policy-approved spatial shift; preserve the actual tool receipt.",
+            response_format=ShiftExecutionResult, tools=[execute_workload_shift],
+            simulator=lambda request, results: results["execute_workload_shift"][0],
+        )
+
+    async def execute(self, plan: dict) -> ShiftExecutionResult:
+        response = await self.run(
+            {"workload_id": plan["workload_id"]},
+            tool_requests=[("execute_workload_shift", {
+                "workload_id": plan["workload_id"], "target_region": plan["target_region"],
+                "shift_type": "spatial_shift", "entra_agent_id": plan["entra_agent_id"],
+            })],
+            authoritative_tool="execute_workload_shift",
+        )
+        return ShiftExecutionResult.model_validate(response.value)
+
+
+def _impact_assessment(request: dict, results: ToolResults) -> dict:
+    source, target = results["get_grid_carbon_intensity"]
+    tiers = list(request["model_tiers"].values())
+    if not tiers or source["gco2_kwh"] <= 0:
+        raise ValueError("Impact estimates require model roles and a positive source intensity.")
+    return {
+        "estimated_co2_reduction_pct": round(
+            100 * (source["gco2_kwh"] - target["gco2_kwh"]) / source["gco2_kwh"], 2
+        ),
+        "green_ai_score": round(100 * tiers.count(MODEL_FAST_GREEN) / len(tiers), 2),
+    }
+
+
+class GreenImpactCriticAgent(Agent):
+    def __init__(self):
+        super().__init__(
+            name="GreenImpactCriticAgent", client=get_chat_client(MODEL_FAST_GREEN),
+            instructions="Calculate equal-energy carbon reduction and the planned fast-tier role share.",
+            response_format=ImpactAssessment, tools=[get_grid_carbon_intensity],
+            simulator=_impact_assessment,
+        )
+
+    async def evaluate(self, plan: dict) -> ImpactAssessment:
+        metrics = get_workload_metrics(plan["workload_id"])
+        response = await self.run(
+            {"model_tiers": plan["model_tiers"]},
+            tool_requests=[
+                ("get_grid_carbon_intensity", {"region": metrics["current_region"]}),
+                ("get_grid_carbon_intensity", {"region": plan["target_region"]}),
+            ],
+            deterministic=True,
+        )
+        return ImpactAssessment.model_validate(response.value)
+
+
 async def _analyze(workload_request: dict) -> dict:
     request = WorkloadRequest.model_validate(workload_request)
     metrics = get_workload_metrics(request.workload_id)
@@ -175,17 +254,32 @@ async def _run_traced(workload_request: dict) -> dict:
     metrics = get_workload_metrics(request.workload_id)
     tracer = EcoPulseTracer()
     with tracer.activate():
-        # Basecamp observes only; the challenge adds mandatory block enforcement.
-        PromptShieldFilter().check(metrics["deployment_notes"])
+        if PromptShieldFilter().check(metrics["deployment_notes"]):
+            return {
+                "workload_id": request.workload_id, "status": "BLOCKED_BY_PROMPT_SHIELD",
+                "target_region": None, "entra_agent_id": tracer.entra_agent_id,
+                "reason": "Untrusted deployment-note injection detected before agent invocation.",
+                "trace_events": list(tracer.trace_events),
+            }
         plan = await _analyze({"workload_id": request.workload_id})
-        if plan["target_gco2_kwh"] is not None and plan["current_gco2_kwh"] > 0:
-            tracer.record(
-                "carbon.saved_estimate", advisory_only=True,
-                estimated_co2_reduction_pct=round(
-                    100 * (plan["current_gco2_kwh"] - plan["target_gco2_kwh"])
-                    / plan["current_gco2_kwh"], 2,
-                ),
+        decision = GovernancePolicyGate().evaluate(
+            get_workload_metrics(request.workload_id),
+            plan["target_region"], tracer.entra_agent_id,
+        )
+        plan.update(decision)
+        if decision["status"] == "APPROVED":
+            plan["model_tiers"].update(
+                executor=MODEL_FAST_GREEN, critic=MODEL_FAST_GREEN,
             )
+            execution = await GreenShiftExecutorAgent().execute(plan)
+            plan.update(execution.model_dump(exclude_none=True))
+            if execution.status == "SHIFT_EXECUTED":
+                impact = await GreenImpactCriticAgent().evaluate(plan)
+                plan.update(impact.model_dump())
+                tracer.record(
+                    "carbon.saved_estimate", advisory_only=False,
+                    **impact.model_dump(),
+                )
         plan["trace_events"] = list(tracer.trace_events)
         return plan
 

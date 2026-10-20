@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import json
 import os
 import subprocess
 import sys
@@ -22,7 +23,7 @@ from mocks.carbon_grid_store import (
 )
 from run_challenge import ROOT, SCENARIOS, scenario_passes, workshop_progress
 from src.foundry_client import (
-    Agent, MODEL_FAST_GREEN, MODEL_REASONING, Workflow, ai_function,
+    Agent, ChatClient, MODEL_FAST_GREEN, MODEL_REASONING, Workflow, ai_function,
     get_chat_client, trace_to,
 )
 
@@ -442,3 +443,209 @@ def test_carbon_thresholds_are_strict(monkeypatch):
     result = module.run_ecopulse_workflow({"workload_id": "ai-embedding-batch"})
     assert result["status"] != "SHIFT_EXECUTED"
     assert SHIFT_EXECUTIONS == []
+
+
+def test_no_green_target_at_exactly_fifty(monkeypatch):
+    module = solution_module()
+    for region in ("swedencentral", "norwayeast"):
+        monkeypatch.setitem(REGION_CARBON_DATA[region], "gco2_kwh", 50)
+    result = module.run_ecopulse_workflow({"workload_id": "cdn-asset-sync"})
+    assert result["status"] == "NO_GREEN_TARGET"
+    assert result["target_region"] is None
+    assert SHIFT_EXECUTIONS == []
+
+
+@pytest.mark.parametrize("workload_id,expected", [
+    ("ai-embedding-batch", "BLOCKED_BY_POLICY"),
+    ("checkout-api", "PENDING_HUMAN_APPROVAL"),
+])
+def test_untrusted_live_assessments_cannot_authorize_actions(monkeypatch, workload_id, expected):
+    module = solution_module()
+    clear_providers(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-not-a-secret")
+
+    async def untrusted_model(self, instructions, payload, results, response_format):
+        if response_format is module.GridAssessment:
+            data = {
+                "target_region": "decommissioned-zone", "source_gco2_kwh": 19,
+                "target_gco2_kwh": 0, "renewable_pct": 100, "reasoning": "Untrusted claim.",
+            }
+        elif response_format is module.ReliabilityAssessment:
+            data = {
+                "projected_latency_ms": 1, "sla_safe": True,
+                "requires_human_approval": False, "reasoning": "Untrusted claim.",
+            }
+        else:
+            data = {
+                "workload_id": workload_id, "criticality_tier": "Tier-2-Batch",
+                "max_latency_ms": 9999, "is_shift_candidate": True,
+                "reasoning": "Untrusted claim.",
+            }
+        return response_format.model_validate(data)
+
+    monkeypatch.setattr(ChatClient, "complete", untrusted_model)
+    result = module.run_ecopulse_workflow({"workload_id": workload_id})
+    assert result["status"] == expected
+    assert result["current_gco2_kwh"] == 410
+    assert result["max_latency_ms"] == get_workload_metrics(workload_id)["max_latency_ms"]
+    assert SHIFT_EXECUTIONS == []
+
+
+def test_action_boundary_rechecks_changed_telemetry(monkeypatch):
+    module = solution_module()
+    original = module.GreenShiftExecutorAgent.execute
+
+    async def telemetry_changed(self, plan):
+        monkeypatch.setitem(WORKLOAD_TELEMETRY["cdn-asset-sync"], "current_latency_ms", 249)
+        return await original(self, plan)
+
+    monkeypatch.setattr(module.GreenShiftExecutorAgent, "execute", telemetry_changed)
+    result = module.run_ecopulse_workflow({"workload_id": "cdn-asset-sync"})
+    assert result["status"] == "BLOCKED_BY_SLA"
+    assert SHIFT_EXECUTIONS == []
+
+
+def test_invalid_identity_fails_explicitly_before_execution(monkeypatch):
+    module = solution_module()
+    monkeypatch.setenv("ENTRA_AGENT_ID", "")
+    with pytest.raises(ValueError, match="ENTRA_AGENT_ID"):
+        module.run_ecopulse_workflow({"workload_id": "ai-embedding-batch"})
+    tools = step_module("step2_mcp_tools")
+    result = tools.execute_workload_shift("ai-embedding-batch", "norwayeast", entra_agent_id="")
+    assert result["status"] == "BLOCKED_BY_POLICY"
+    assert SHIFT_EXECUTIONS == []
+
+
+def test_live_failure_does_not_call_simulator(monkeypatch):
+    clear_providers(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-not-a-secret")
+    simulated = []
+
+    class Answer(BaseModel):
+        value: int
+
+    async def unavailable(*args, **kwargs):
+        raise RuntimeError("Provider unavailable")
+
+    monkeypatch.setattr(ChatClient, "complete", unavailable)
+    agent = Agent(
+        name="live", client=get_chat_client(), instructions="Test failure.",
+        response_format=Answer,
+        simulator=lambda request, results: simulated.append(True),
+    )
+    with pytest.raises(RuntimeError, match="Provider unavailable"):
+        asyncio.run(agent.run({}))
+    assert simulated == []
+
+
+@pytest.mark.parametrize("provider", ["openai", "github", "azure_openai", "foundry"])
+def test_installed_official_sdks_with_mock_http_transport(monkeypatch, provider):
+    """Exercise real SDK serialization/parsing, but never open a network socket."""
+    sdk = pytest.importorskip("openai")
+    http = importlib.import_module(
+        "httpx2" if importlib.util.find_spec("httpx2") else "httpx"
+    )
+    clear_providers(monkeypatch)
+    configuration = {
+        "openai": {"OPENAI_API_KEY": "test-not-a-secret"},
+        "github": {"GITHUB_TOKEN": "test-not-a-secret"},
+        "azure_openai": {
+            "AZURE_OPENAI_ENDPOINT": "https://test.openai.azure.com",
+            "AZURE_OPENAI_API_KEY": "test-not-a-secret",
+        },
+        "foundry": {"AZURE_AI_PROJECT_ENDPOINT": "https://test.services.ai.azure.com/api/projects/test"},
+    }
+    for name, value in configuration[provider].items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("MODEL_FAST_GREEN", "test-deployment")
+    seen = []
+
+    def respond(request):
+        seen.append(request)
+        payload = json.loads(request.content)
+        assert payload["model"] == "test-deployment"
+        if provider == "foundry":
+            body = {
+                "id": "resp_test", "object": "response", "created_at": 0,
+                "model": "test-deployment", "status": "completed",
+                "output": [{
+                    "type": "message", "id": "msg_test", "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": '{"value":42}', "annotations": []}],
+                }],
+            }
+        else:
+            assert payload["response_format"]["type"] == "json_schema"
+            body = {
+                "id": "chat_test", "object": "chat.completion", "created": 0,
+                "model": "test-deployment",
+                "choices": [{
+                    "index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": '{"value":42}'},
+                }],
+            }
+        return http.Response(200, json=body)
+
+    transport = http.MockTransport(respond)
+    original_openai, original_azure = sdk.OpenAI, sdk.AzureOpenAI
+
+    def openai_client(**kwargs):
+        if "http_client" not in kwargs:
+            kwargs["http_client"] = http.Client(transport=transport)
+        return original_openai(**kwargs)
+
+    def azure_client(**kwargs):
+        return original_azure(**kwargs, http_client=http.Client(transport=transport))
+
+    monkeypatch.setattr(sdk, "OpenAI", openai_client)
+    monkeypatch.setattr(sdk, "AzureOpenAI", azure_client)
+    if provider == "foundry":
+        projects = pytest.importorskip("azure.ai.projects")
+        identity = pytest.importorskip("azure.identity")
+        core_credentials = importlib.import_module("azure.core.credentials")
+        credential = MagicMock()
+        credential.__enter__.return_value = credential
+        credential.get_token.return_value = core_credentials.AccessToken(
+            "test-not-a-secret", 4102444800,
+        )
+        monkeypatch.setattr(identity, "DefaultAzureCredential", lambda: credential)
+        original_factory = projects.AIProjectClient.get_openai_client
+
+        def foundry_client(self, **kwargs):
+            return original_factory(self, **kwargs, http_client=http.Client(transport=transport))
+
+        monkeypatch.setattr(projects.AIProjectClient, "get_openai_client", foundry_client)
+
+    class Answer(BaseModel):
+        value: int
+
+    answer = asyncio.run(get_chat_client().complete("Return an integer.", {}, {}, Answer))
+    assert answer.value == 42
+    assert len(seen) == 1
+    assert seen[0].url.host == {
+        "openai": "api.openai.com", "github": "models.github.ai",
+        "azure_openai": "test.openai.azure.com", "foundry": "test.services.ai.azure.com",
+    }[provider]
+
+
+def test_optional_otel_bridge_exports_attributed_spans(monkeypatch):
+    governance = step_module("step4_governance")
+    sdk_trace = pytest.importorskip("opentelemetry.sdk.trace")
+    exports = importlib.import_module("opentelemetry.sdk.trace.export")
+    memory = importlib.import_module("opentelemetry.sdk.trace.export.in_memory_span_exporter")
+    exporter = memory.InMemorySpanExporter()
+    provider = sdk_trace.TracerProvider()
+    provider.add_span_processor(exports.SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(governance.otel_trace, "get_tracer", provider.get_tracer)
+    tracer = governance.EcoPulseTracer()
+    try:
+        for event in ("agent.turn", "tool.call", "carbon.saved_estimate"):
+            tracer.record(event, simulated=True)
+        spans = exporter.get_finished_spans()
+        assert [span.name for span in spans] == ["agent.turn", "tool.call", "carbon.saved_estimate"]
+        assert all(
+            span.events[0].attributes["entra_agent_id"] == tracer.entra_agent_id
+            for span in spans
+        )
+    finally:
+        provider.shutdown()
