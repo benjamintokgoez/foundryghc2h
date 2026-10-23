@@ -29,6 +29,15 @@ does not mutate the fixtures. Repeated runs remain reproducible.
 
 ## Agent architecture
 
+Use the official Microsoft Agent Framework Python SDK for every agent turn.
+`src/foundry_client.py` adapts its Agent, tool, and chat-client APIs to the
+workshop contracts; it must not implement an independent agent runtime.
+Simulation uses the real SDK with a local deterministic chat client and no
+network access. Live inference uses framework provider clients. Trusted tool
+requests are executed through SDK tools and are never selected by model output.
+The local Workflow helper coordinates concurrent SDK agents with
+`asyncio.gather`; it does not claim to be a framework workflow graph.
+
 1. `WorkloadTriageAgent` produces a Pydantic `WorkloadAssessment`.
 2. Concurrent fan-out: `GridSustainabilityAgent` selects a green region, while
    `CloudReliabilityAgent` checks the 28ms latency increment.

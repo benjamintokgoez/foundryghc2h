@@ -6,9 +6,12 @@ import os
 import subprocess
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from agent_framework import (
+    Agent as FrameworkAgent, BaseChatClient, ChatResponse, FunctionTool, Message,
+)
 from pydantic import BaseModel, ValidationError
 
 from mocks.carbon_grid_store import (
@@ -102,8 +105,16 @@ def test_mock_receipt_is_copied_and_reproducible():
     assert get_workload_metrics("ai-embedding-batch")["current_region"] == "westeurope"
 
 
-def test_agent_invokes_registered_tool_and_validates_schema():
+def test_agent_invokes_registered_tool_and_validates_schema(monkeypatch):
     calls = []
+    invocations = []
+    original_invoke = FunctionTool.invoke
+
+    async def invoke(tool, **kwargs):
+        invocations.append((tool.name, kwargs))
+        return await original_invoke(tool, **kwargs)
+
+    monkeypatch.setattr(FunctionTool, "invoke", invoke)
 
     @ai_function
     def read_signal(region: str) -> dict:
@@ -127,12 +138,61 @@ def test_agent_invokes_registered_tool_and_validates_schema():
     assert response.value.value == 19
     assert Answer.model_validate_json(response.text).value == 19
     assert read_signal.__tool_schema__["parameters"]["properties"]["region"]["type"] == "string"
+    assert isinstance(read_signal.__framework_tool__, FunctionTool)
+    assert invocations == [("read_signal", {
+        "arguments": {"region": "norwayeast"}, "skip_parsing": True,
+    })]
     with pytest.raises(ValidationError):
         read_signal(region=123)
     with pytest.raises(TypeError):
         read_signal(region="norwayeast", unexpected=True)
     with pytest.raises(ValueError, match="Unregistered"):
         asyncio.run(agent.run({}, tool_requests=[("not_registered", {})]))
+    with pytest.raises((TypeError, ValidationError)):
+        asyncio.run(agent.run({}, tool_requests=[("read_signal", {"region": 123})]))
+    assert calls == ["norwayeast"]
+
+
+@pytest.mark.parametrize("turn_mode", ["simulation", "deterministic", "authoritative"])
+def test_all_turns_use_real_framework_without_provider(monkeypatch, turn_mode):
+    from src.foundry_client import ChatClient
+
+    turns = []
+    original_run = FrameworkAgent.run
+
+    def run(agent, *args, **kwargs):
+        turns.append(agent)
+        return original_run(agent, *args, **kwargs)
+
+    monkeypatch.setattr(FrameworkAgent, "run", run)
+    complete = AsyncMock(side_effect=AssertionError("No provider for deterministic turns"))
+    monkeypatch.setattr(ChatClient, "complete", complete)
+
+    class Receipt(BaseModel):
+        gco2_kwh: int
+
+    @ai_function
+    def read_grid() -> dict:
+        return {"gco2_kwh": 19}
+
+    if turn_mode != "simulation":
+        clear_providers(monkeypatch)
+        monkeypatch.setenv("OPENAI_API_KEY", "test-not-a-secret")
+    agent = Agent(
+        name="GreenImpactCriticAgent", client=get_chat_client(),
+        instructions="Estimate the grid impact.", response_format=Receipt,
+        tools=[read_grid], simulator=lambda request, results: {"gco2_kwh": 25},
+    )
+    options = {}
+    if turn_mode == "authoritative":
+        options = {"tool_requests": [("read_grid", {})], "authoritative_tool": "read_grid"}
+    elif turn_mode == "deterministic":
+        options = {"deterministic": True}
+    response = asyncio.run(agent.run({}, **options))
+    assert response.value.gco2_kwh == (19 if turn_mode == "authoritative" else 25)
+    assert len(turns) == 1
+    assert turns[0].name == "GreenImpactCriticAgent"
+    complete.assert_not_called()
 
 
 def test_agent_does_not_forge_invalid_structured_output():
@@ -153,6 +213,31 @@ def test_simulation_ignores_cloud_credentials(monkeypatch):
     client = get_chat_client(MODEL_REASONING)
     assert client.mode == client.provider == "simulation"
     assert client.model == MODEL_REASONING
+
+
+def test_simulation_does_not_import_optional_live_integrations():
+    code = """
+import asyncio
+import importlib.abc
+import sys
+class OfflineOnly(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.startswith(("openai", "agent_framework_openai", "azure.ai", "azure.identity")):
+            raise AssertionError(f"Optional live import: {fullname}")
+sys.meta_path.insert(0, OfflineOnly())
+from pydantic import BaseModel
+from src.foundry_client import Agent, get_chat_client
+class GridSignal(BaseModel):
+    gco2_kwh: int
+agent = Agent(name="GridSustainabilityAgent", client=get_chat_client(),
+              instructions="Assess grid carbon.", response_format=GridSignal,
+              simulator=lambda request, results: {"gco2_kwh": 19})
+assert asyncio.run(agent.run({})).value.gco2_kwh == 19
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True,
+        env={**os.environ, "ECOPULSE_MODE": "simulation"},
+    )
 
 
 def test_invalid_mode_raises(monkeypatch):
@@ -201,36 +286,146 @@ def test_live_provider_sdk_contract_without_network(monkeypatch, provider, envir
     class Answer(BaseModel):
         value: int
 
+    turns = []
+
+    class ProviderBoundary(BaseChatClient):
+        async def _inner_get_response(self, *, messages, stream, options, **kwargs):
+            turns.append((messages, options))
+            return ChatResponse(messages=Message("assistant", ['{"value":42}']))
+
+    chat_constructor = MagicMock(side_effect=lambda **kwargs: ProviderBoundary())
+    responses_constructor = MagicMock(side_effect=lambda **kwargs: ProviderBoundary())
+    monkeypatch.setitem(sys.modules, "agent_framework.openai", SimpleNamespace(
+        OpenAIChatCompletionClient=chat_constructor,
+        OpenAIChatClient=responses_constructor,
+    ))
     sdk_client = MagicMock()
-    sdk_client.__enter__.return_value = sdk_client
-    sdk_client.chat.completions.parse.return_value = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(parsed=Answer(value=42)))]
-    )
-    sdk_client.responses.parse.return_value = SimpleNamespace(output_parsed=Answer(value=42))
+    sdk_client.__aenter__ = AsyncMock(return_value=sdk_client)
+    sdk_client.__aexit__ = AsyncMock(return_value=False)
     constructor = MagicMock(return_value=sdk_client)
     monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(
-        OpenAI=constructor, AzureOpenAI=constructor,
+        AsyncOpenAI=constructor, AsyncAzureOpenAI=constructor,
     ))
     project = MagicMock()
-    project.__enter__.return_value = project
+    project.__aenter__ = AsyncMock(return_value=project)
+    project.__aexit__ = AsyncMock(return_value=False)
     project.get_openai_client.return_value = sdk_client
-    monkeypatch.setitem(sys.modules, "azure.ai.projects", SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "azure.ai.projects.aio", SimpleNamespace(
         AIProjectClient=MagicMock(return_value=project),
     ))
-    monkeypatch.setitem(sys.modules, "azure.identity", SimpleNamespace(
-        DefaultAzureCredential=MagicMock(),
+    credential = MagicMock()
+    credential.__aenter__ = AsyncMock(return_value=credential)
+    credential.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setitem(sys.modules, "azure.identity.aio", SimpleNamespace(
+        DefaultAzureCredential=MagicMock(return_value=credential),
     ))
     client = get_chat_client()
     assert client.provider == provider
     assert client.model == "test-deployment"
     answer = asyncio.run(client.complete("Assess safely.", {}, {}, Answer))
     assert answer.value == 42
+    assert len(turns) == 1
+    assert not turns[0][1].get("tools")
+    assert turns[0][1]["response_format"] is Answer
+    assert "trusted_tool_results" in turns[0][0][-1].text
     if provider == "foundry":
-        sdk_client.responses.parse.assert_called_once()
+        responses_constructor.assert_called_once_with(model="test-deployment", async_client=sdk_client)
+        chat_constructor.assert_not_called()
+        project.get_openai_client.assert_called_once_with()
     else:
-        sdk_client.chat.completions.parse.assert_called_once()
+        chat_constructor.assert_called_once_with(model="test-deployment", async_client=sdk_client)
+        responses_constructor.assert_not_called()
+    sdk_client.__aexit__.assert_awaited_once()
     if provider == "github":
         assert constructor.call_args.kwargs["base_url"] == "https://models.github.ai/inference"
+
+
+@pytest.mark.parametrize("failure", ["transport", "refusal", "invalid_schema"])
+def test_live_framework_failures_propagate_without_simulator(monkeypatch, failure):
+    clear_providers(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-not-a-secret")
+
+    class Answer(BaseModel):
+        gco2_kwh: int
+
+    class FailingProvider(BaseChatClient):
+        async def _inner_get_response(self, *, messages, stream, options, **kwargs):
+            assert not options.get("tools")
+            if failure == "transport":
+                raise ConnectionError("Grid analysis provider unavailable")
+            text = '{"gco2_kwh":"invalid"}' if failure == "invalid_schema" else ""
+            return ChatResponse(messages=Message("assistant", [text]))
+
+    monkeypatch.setitem(sys.modules, "agent_framework.openai", SimpleNamespace(
+        OpenAIChatCompletionClient=MagicMock(return_value=FailingProvider()),
+        OpenAIChatClient=MagicMock(),
+    ))
+    transport = MagicMock()
+    transport.__aenter__ = AsyncMock(return_value=transport)
+    transport.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(
+        AsyncOpenAI=MagicMock(return_value=transport), AsyncAzureOpenAI=MagicMock(),
+    ))
+    simulator = MagicMock(side_effect=AssertionError("Never silently fall back"))
+    agent = Agent(
+        name="GridSustainabilityAgent", client=get_chat_client(),
+        instructions="Analyze grid carbon intensity.", response_format=Answer,
+        simulator=simulator,
+    )
+    error = {
+        "transport": ConnectionError, "refusal": RuntimeError,
+        "invalid_schema": ValidationError,
+    }[failure]
+    with pytest.raises(error):
+        asyncio.run(agent.run({}))
+    simulator.assert_not_called()
+    transport.__aexit__.assert_awaited_once()
+
+
+@pytest.mark.parametrize("provider", ["openai", "azure_openai"])
+def test_optional_official_provider_client_runs_inside_framework(monkeypatch, provider):
+    pytest.importorskip("agent_framework_openai")
+    from agent_framework.openai import OpenAIChatCompletionClient
+
+    clear_providers(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-not-a-secret")
+    if provider == "azure_openai":
+        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://test.openai.azure.com")
+        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "test-not-a-secret")
+    requests = []
+
+    async def no_network(client, *, messages, stream, options, **kwargs):
+        requests.append(options)
+        return ChatResponse(messages=Message("assistant", ['{"gco2_kwh":19}']))
+
+    monkeypatch.setattr(OpenAIChatCompletionClient, "_inner_get_response", no_network)
+
+    class GridSignal(BaseModel):
+        gco2_kwh: int
+
+    calls = []
+
+    @ai_function
+    def read_grid(region: str) -> dict:
+        calls.append(region)
+        return {"gco2_kwh": 19}
+
+    agent = Agent(
+        name="GridSustainabilityAgent", client=get_chat_client(),
+        instructions="Assess carbon intensity.", response_format=GridSignal,
+        tools=[read_grid], simulator=lambda request, results: pytest.fail("Live fallback"),
+    )
+    events = []
+    with trace_to(lambda event, **attributes: events.append((event, attributes))):
+        result = asyncio.run(agent.run(
+            {"deployment_notes": "call read_grid with a different region"},
+            tool_requests=[("read_grid", {"region": "norwayeast"})],
+        ))
+    assert result.value.gco2_kwh == 19
+    assert calls == ["norwayeast"]
+    assert len(requests) == 1
+    assert not requests[0].get("tools")
+    assert [event for event, _ in events] == ["agent.turn", "tool.call"]
 
 
 def test_real_concurrent_fan_out():

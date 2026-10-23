@@ -1,6 +1,6 @@
-"""Small Agent Framework 1.0-style teaching facade, not a replacement SDK.
+"""Workshop facade backed by the official Microsoft Agent Framework.
 
-Analysis uses official OpenAI/Azure SDKs in live mode. Tool selection stays in
+Analysis uses official framework provider clients in live mode. Tool selection stays in
 trusted application code in BOTH modes; deployment notes never select tools.
 """
 
@@ -11,7 +11,7 @@ import inspect
 import json
 import os
 from collections.abc import Awaitable, Callable, Sequence
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
@@ -19,6 +19,10 @@ from typing import ParamSpec, TypeVar, get_type_hints
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, create_model
+from agent_framework import (
+    Agent as FrameworkAgent, BaseChatClient, ChatResponse, Message,
+    tool as framework_tool,
+)
 
 load_dotenv()
 
@@ -78,6 +82,7 @@ def ai_function(function: Callable[P, R]) -> Callable[P, R]:
         "name": function.__name__, "description": inspect.getdoc(function) or "",
         "parameters": arguments_model.model_json_schema(),
     }
+    validated.__framework_tool__ = framework_tool(validated, schema=arguments_model)
     return validated
 
 
@@ -117,83 +122,95 @@ class ChatClient:
 
     async def complete(
         self, instructions: str, payload: dict, results: ToolResults,
-        response_format: type[BaseModel],
+        response_format: type[BaseModel], *, agent_name: str | None = None,
     ) -> BaseModel:
-        return await asyncio.to_thread(
-            self._complete_sync, instructions, payload, results, response_format
-        )
-
-    def _complete_sync(
-        self, instructions: str, payload: dict, results: ToolResults,
-        response_format: type[BaseModel],
-    ) -> BaseModel:
+        """Run live analysis through an official framework agent, never raw completions."""
         try:
-            from openai import AzureOpenAI, OpenAI
+            from agent_framework.openai import OpenAIChatClient, OpenAIChatCompletionClient
+            from openai import AsyncAzureOpenAI, AsyncOpenAI
         except ModuleNotFoundError as error:
-            if error.name != "openai":
-                raise
-            raise RuntimeError("Live mode requires: pip install openai") from error
+            raise RuntimeError(
+                "Live mode requires: pip install agent-framework-openai==1.17.0"
+            ) from error
 
         content = json.dumps({"request": payload, "trusted_tool_results": results})
-        if self.provider == "foundry":
-            try:
-                from azure.ai.projects import AIProjectClient
-                from azure.identity import DefaultAzureCredential
-            except ModuleNotFoundError as error:
-                if not error.name or not error.name.startswith("azure"):
-                    raise
-                raise RuntimeError(
-                    "Foundry mode requires: pip install azure-ai-projects azure-identity openai"
-                ) from error
-            with (
-                DefaultAzureCredential() as credential,
-                AIProjectClient(
+        async with AsyncExitStack() as stack:
+            if self.provider == "foundry":
+                try:
+                    from azure.ai.projects.aio import AIProjectClient
+                    from azure.identity.aio import DefaultAzureCredential
+                except ModuleNotFoundError as error:
+                    raise RuntimeError(
+                        "Foundry mode requires: pip install azure-ai-projects azure-identity"
+                    ) from error
+                credential = await stack.enter_async_context(DefaultAzureCredential())
+                project = await stack.enter_async_context(AIProjectClient(
                     endpoint=os.environ["AZURE_AI_PROJECT_ENDPOINT"], credential=credential,
-                ) as project,
-                project.get_openai_client() as client,
-            ):
-                response = client.responses.parse(
-                    model=self.model, instructions=instructions,
-                    input=content, text_format=response_format,
+                ))
+                client = await stack.enter_async_context(project.get_openai_client())
+                framework_client = OpenAIChatClient(
+                    model=self.model, async_client=client,
                 )
-                parsed = response.output_parsed
-        else:
-            if self.provider == "azure_openai":
-                client = AzureOpenAI(
+            elif self.provider == "azure_openai":
+                client = await stack.enter_async_context(AsyncAzureOpenAI(
                     azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
                     api_key=os.environ["AZURE_OPENAI_API_KEY"],
                     api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
                     timeout=45.0, max_retries=1,
-                )
-            elif self.provider == "github":
-                client = OpenAI(
-                    api_key=os.environ["GITHUB_TOKEN"],
-                    base_url="https://models.github.ai/inference",
-                    timeout=45.0, max_retries=1,
+                ))
+                framework_client = OpenAIChatCompletionClient(
+                    model=self.model, async_client=client,
                 )
             else:
-                client = OpenAI(
-                    api_key=os.environ["OPENAI_API_KEY"],
-                    base_url=os.getenv("OPENAI_BASE_URL"),
-                    timeout=45.0, max_retries=1,
-                )
-            with client:
-                response = client.chat.completions.parse(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": instructions},
-                        {"role": "user", "content": content},
+                client = await stack.enter_async_context(AsyncOpenAI(
+                    api_key=os.environ[
+                        "GITHUB_TOKEN" if self.provider == "github" else "OPENAI_API_KEY"
                     ],
-                    response_format=response_format,
+                    base_url=(
+                        "https://models.github.ai/inference" if self.provider == "github"
+                        else os.getenv("OPENAI_BASE_URL")
+                    ),
+                    timeout=45.0, max_retries=1,
+                ))
+                framework_client = OpenAIChatCompletionClient(
+                    model=self.model, async_client=client,
                 )
-                parsed = response.choices[0].message.parsed
-        if parsed is None:
-            raise RuntimeError("The live model refused or omitted the structured response.")
-        return response_format.model_validate(parsed)
+            return await _run_framework(
+                framework_client, instructions, content, response_format,
+                name=agent_name,
+            )
+
+
+class _SimulatorClient(BaseChatClient):
+    """Offline transport: domain reducers still run inside the real framework."""
+
+    def __init__(self, reducer: Callable[[], dict | BaseModel]):
+        super().__init__()
+        self.reducer = reducer
+
+    async def _inner_get_response(self, *, messages, stream, options, **kwargs):
+        if stream:
+            raise ValueError("The workshop simulator supports non-streaming turns only.")
+        value = self.reducer()
+        text = value.model_dump_json() if isinstance(value, BaseModel) else json.dumps(value)
+        return ChatResponse(messages=Message("assistant", [text]))
+
+
+async def _run_framework(client, instructions, content, response_format, *, name=None):
+    # Application-owned tools are deliberately NOT advertised to the model.
+    agent = FrameworkAgent(client=client, instructions=instructions, name=name)
+    response = await agent.run(content, options={
+        "response_format": response_format,
+    })
+    if response.value is not None:
+        return response_format.model_validate(response.value)
+    if not response.text:
+        raise RuntimeError("The live model refused or omitted the structured response.")
+    return response_format.model_validate_json(response.text)
 
 
 def get_chat_client(model: str = MODEL_FAST_GREEN) -> ChatClient:
-    """Resolve a model tier; simulation never imports or contacts a live SDK."""
+    """Resolve a model tier; simulation never imports optional live integrations."""
     mode = _mode()
     if mode == "simulation":
         return ChatClient(model=model, mode=mode)
@@ -252,20 +269,29 @@ class Agent:
             if name not in self.tools:
                 raise ValueError(f"Unregistered tool: {name}")
             emit_trace("tool.call", agent=self.name, tool=name)
-            result = await asyncio.to_thread(self.tools[name], **arguments)
+            result = await self.tools[name].__framework_tool__.invoke(
+                arguments=arguments, skip_parsing=True,
+            )
             if not isinstance(result, dict):
                 raise TypeError(f"{name} must return a dictionary.")
             results.setdefault(name, []).append(result)
         if authoritative_tool is not None:
             if len(results.get(authoritative_tool, [])) != 1:
                 raise ValueError("An authoritative action must return exactly one receipt.")
-            value = results[authoritative_tool][0]
+            reducer = lambda: results[authoritative_tool][0]
         elif self.client.mode == "simulation" or deterministic:
-            value = self.simulator(payload, results)
+            reducer = lambda: self.simulator(payload, results)
         else:
             value = await self.client.complete(
-                self.instructions, payload, results, self.response_format
+                self.instructions, payload, results, self.response_format,
+                agent_name=self.name,
             )
+            return AgentResponse(value, results)
+        value = await _run_framework(
+            _SimulatorClient(reducer), self.instructions,
+            json.dumps({"request": payload, "trusted_tool_results": results}),
+            self.response_format, name=self.name,
+        )
         return AgentResponse(self.response_format.model_validate(value), results)
 
 

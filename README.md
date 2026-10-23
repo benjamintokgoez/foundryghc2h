@@ -66,13 +66,18 @@ Authoritative telemetry -> Prompt Shield (enforced in solution)
     -> GreenImpactCriticAgent -> estimates + attributed trace events
 ```
 
-`src/foundry_client.py` provides an intentionally small **Agent Framework
-1.0-style compatibility facade**, not a vendored or drop-in full SDK.
-`Agent.run` is async, invokes registered `@ai_function` tools selected by trusted
-application code, and validates Pydantic `response_format` schemas.
-`Workflow.fan_out` uses real concurrent async turns. Offline reducers are
-explicit domain logic, not canned LLM strings. Routine reasoning uses
-`MODEL_FAST_GREEN`; SLA reasoning uses `MODEL_REASONING`.
+`src/foundry_client.py` is a small workshop adapter over the **official Microsoft
+Agent Framework Python SDK** (`agent-framework-core`, a required dependency).
+Every agent turn uses the SDK's `Agent`, including offline, deterministic critic,
+and authoritative action-receipt turns. Simulation supplies a local chat client
+with an explicit domain reducer; it does not simulate the agent framework itself.
+The adapter preserves the workshop's async `Agent.run`, validated `.value` /
+`.text` response, and `@ai_function` interface using SDK tools.
+Tool names and arguments come exclusively from explicit, trusted application
+requests; tools are not offered to the model for autonomous selection.
+`Workflow.fan_out` uses `asyncio.gather` to await real framework agents
+concurrently; this helper is application orchestration, not an SDK workflow graph.
+Routine reasoning uses `MODEL_FAST_GREEN`; SLA reasoning uses `MODEL_REASONING`.
 
 The tools are local **MCP-shaped** functions, not an MCP transport/server.
 Actions always simulate Kubernetes shifts; no cluster is contacted. The local
@@ -86,11 +91,13 @@ does not claim the four scenario assertions pass.
 ## Optional live analysis
 
 ```bash
-python -m pip install openai
-# Foundry additionally:
+# Agent Framework core is installed by requirements.txt.
+# Framework provider clients for live analysis:
+python -m pip install agent-framework-openai==1.17.0
+# Foundry project access additionally:
 python -m pip install azure-ai-projects azure-identity
-# Optional full SDK for further exercises and real telemetry:
-# python -m pip install agent-framework opentelemetry-sdk
+# Optional OpenTelemetry bridge:
+# python -m pip install opentelemetry-sdk
 ```
 
 Set `ECOPULSE_MODE=live` in `.env`, and configure **one** provider. Precedence is
@@ -107,16 +114,28 @@ For non-Foundry providers, **remove** the example `AZURE_AI_PROJECT_ENDPOINT`
 from `.env`. Replace `MODEL_FAST_GREEN` and `MODEL_REASONING` with deployed
 model identifiers available to your provider; the defaults are workshop labels
 and not universally available models. Live providers must support structured
-output. Foundry uses official `AIProjectClient.get_openai_client()` and the
-Responses API; the other providers use official OpenAI structured chat clients.
+output. Foundry wraps `AIProjectClient.get_openai_client()` with the framework's
+Responses client; the other providers use the framework's OpenAI/Azure chat
+clients. Model inference runs through a framework agent, not direct completion
+calls from workshop code.
 Errors, refusals, unsupported models, and missing credentials surface explicitly;
-live mode never quietly becomes simulation. The optional `agent-framework`
-package is not needed by this deliberately narrow SDK-backed facade.
+live mode never quietly becomes simulation. The larger `agent-framework`
+meta-package is unnecessary: the official core distribution supplies Agent and
+tool APIs, with `agent-framework-openai` supplying optional live provider clients.
 
 Model analysis is probabilistic in live mode. Authorization, action arguments,
 receipts, critic arithmetic, and SLA enforcement stay in deterministic trusted
 code. The four reproducible reference scenarios are verified in simulation.
 Do not submit private deployment notes to an external provider.
+
+## Copy-ready presentation prompts
+
+[CHALLENGE.md](CHALLENGE.md) contains prompts for starter readiness, `step-1`,
+`step-2`, `step-3`, `basecamp` / `step-4`, and the complete challenge, with expected
+states and verification criteria. Copy the prompt blocks into your slides and
+paste them into Copilot in sequence to build from this starter.
+Published checkpoint branches are snapshots; this change updates the current
+branch only and does not rewrite older checkpoints.
 
 ## Reuse and license
 
