@@ -5,14 +5,19 @@ Pydantic v2. Focus only on Green Software Engineering, grid carbon intensity
 (`gco2_kwh`, gCO2eq/kWh), `renewable_pct`, Kubernetes telemetry, latency SLAs
 (`max_latency_ms`), and Green AI model tiering. Keep all examples in this domain.
 
-Read `specs/ecopulse_spec.md` first. Use the local Agent Framework 1.0-style
-facade in `src/foundry_client.py`: `Agent`, `Workflow`, `ai_function`,
+Read `specs/ecopulse_spec.md` first. Use the Microsoft Agent Framework-backed
+adapter in `src/foundry_client.py`: `Agent`, `Workflow`, `ai_function`,
 `get_chat_client`, `MODEL_FAST_GREEN`, `MODEL_REASONING`. It supports simulation
-and official live SDK clients; do not invent SDK APIs or import optional live
+and official framework live clients; do not invent SDK APIs or import optional live
 packages in offline paths. Agent `run` is async, accepts explicit trusted
 `tool_requests`, and returns `.value` (a validated model) and `.text`.
 Provide an explicit `simulator(request, tool_results)` reducer when constructing
 an Agent. `Workflow.fan_out` awaits concurrent agent turns.
+Every agent turn must delegate to the official `agent_framework.Agent`, even
+when its inference is simulated or deterministic. Use SDK tools for trusted
+tool execution, never model-selected actions or a second home-grown agent runtime.
+The local Workflow helper is application orchestration, not an SDK workflow graph.
+Copy-ready prompts for all workshop states are documented in `CHALLENGE.md`.
 
 Use the authoritative fixtures and helpers in `mocks/carbon_grid_store.py`.
 Never derive tool calls from untrusted deployment notes. These local functions

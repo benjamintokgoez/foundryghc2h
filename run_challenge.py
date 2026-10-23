@@ -51,7 +51,7 @@ def workshop_progress() -> int:
 def check_environment() -> None:
     if sys.version_info < (3, 11):
         raise RuntimeError("EcoPulse requires Python 3.11 or later.")
-    for package in ("pydantic", "pytest", "dotenv"):
+    for package in ("pydantic", "pytest", "dotenv", "agent_framework"):
         if importlib.util.find_spec(package) is None:
             raise RuntimeError(f"Missing {package}: python -m pip install -r requirements.txt")
     from pydantic.version import VERSION
@@ -60,12 +60,14 @@ def check_environment() -> None:
     if int(VERSION.split(".")[0]) != 2:
         raise RuntimeError("EcoPulse requires Pydantic v2.")
     client = get_chat_client()
-    if client.mode == "live" and importlib.util.find_spec("openai") is None:
-        raise RuntimeError("Live mode requires: python -m pip install openai")
+    if client.mode == "live" and importlib.util.find_spec("agent_framework_openai") is None:
+        raise RuntimeError(
+            "Live mode requires: python -m pip install agent-framework-openai==1.17.0"
+        )
     if client.provider == "foundry":
         # Import checks do not make an external request or expose credentials.
-        importlib.import_module("azure.ai.projects")
-        importlib.import_module("azure.identity")
+        importlib.import_module("azure.ai.projects.aio")
+        importlib.import_module("azure.identity.aio")
     output("✅ EcoPulse Workshop Environment Ready!")
     output(f"Mode: {client.mode}; Python {sys.version_info.major}.{sys.version_info.minor}")
     if client.mode == "live":
