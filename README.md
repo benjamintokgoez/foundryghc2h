@@ -12,6 +12,8 @@ agents, then govern a safe workload shift in a 30-minute challenge.
 Use **Python 3.11+**. No cloud account, external API key, or live SDK is needed.
 
 ```bash
+git clone https://github.com/benjamintokgoez/foundryghc2h.git
+cd foundryghc2h
 python3.11 -m venv .venv  # or another installed Python 3.11+ interpreter
 source .venv/bin/activate
 # Windows PowerShell: .venv\Scripts\Activate.ps1
@@ -37,7 +39,7 @@ before the session. With installed dependencies, simulation uses no network.
 | `step-3` | Micro-Task #3, 01:06 | Concurrent multi-agent analysis |
 | `basecamp` | Challenge start, 01:21 | Tracing and a deliberately unenforced shield |
 | `step-4` | Alias for `basecamp` | Same commit as `basecamp` |
-| `solution-complete` | Debrief, 01:48 | Executor, approval gate, shield and critic |
+| `solution-complete` | Wrap-up, 01:51 | Executor, approval gate, shield and critic |
 
 ```bash
 git checkout step-1
@@ -47,8 +49,18 @@ git checkout basecamp
 git checkout solution-complete
 ```
 
-At each checkpoint: **Fire** a workload, **Listen** to the recommendation,
-**Inspect** structured output and traces. Begin the final mission in
+Copilot creates the step files as untracked files, and Git refuses to switch to a
+checkpoint that contains the same files. Stash first, then switch; your own
+attempt stays recoverable with `git stash pop`:
+
+```bash
+git stash --include-untracked
+git checkout basecamp
+```
+
+At each micro-task: **Fire** the prompt from [PROMPTS.md](PROMPTS.md) in Copilot
+Agent Mode, **Listen** to the session while Copilot builds, then **Inspect** the
+scoreboard, structured output and traces. Begin the final mission in
 [CHALLENGE.md](CHALLENGE.md). The normative contract is
 [specs/ecopulse_spec.md](specs/ecopulse_spec.md).
 
@@ -82,6 +94,16 @@ OpenTelemetry-style events work offline; installing `opentelemetry-sdk` bridges
 events to an externally configured tracer provider (no exporter is enabled here).
 Before `solution-complete`, plans are advisory and the challenge scoreboard
 does not claim the four scenario assertions pass.
+
+## Why agents here?
+
+Honestly: with four tidy fixtures, plain if-statements would do. The offline
+reducers in this repo are deterministic Python on purpose, so the workshop is
+reproducible and needs no model. We use agents because production telemetry is
+messier (free-text notes, missing or wrong tier labels, trade-offs no rule list
+covers), and the pattern we practice holds there: the model advises, trusted code
+decides. `GovernancePolicyGate`, the shield, the receipt and the CO2 arithmetic are
+deterministic, and model output never authorizes an action.
 
 ## Optional live analysis
 
@@ -124,15 +146,15 @@ This workshop is available under the [MIT License](LICENSE). You can use, modify
 and redistribute it, including adapting it for your own workshops. Retain the
 license and copyright notice when redistributing copies or substantial portions.
 
-## Publish when ready
+## Publishing your own copy
 
-The generator leaves `main` checked out with every local checkpoint committed.
-If no remote exists:
+The reference copy of this workshop lives at
+<https://github.com/benjamintokgoez/foundryghc2h>. To publish an adapted copy,
+push every checkpoint branch, not only `main`:
 
 ```bash
-gh repo create ecopulse-agent-workshop --public --source=. --remote=origin --push
+gh repo create <your-repo-name> --public --source=. --remote=origin --push
 git push origin --all
 ```
 
-If a remote already exists, inspect `git remote -v` before pushing. Publishing is
-an explicit facilitator action; repository generation does not publish anything.
+If a remote already exists, inspect `git remote -v` before pushing.
